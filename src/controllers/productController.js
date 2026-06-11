@@ -206,18 +206,16 @@ exports.adminDeleteProduct = async (req, res) => {
   const { id } = req.params;
 
   try {
-    // Soft delete (archive) as per PRD
-    const product = await Product.findOneAndUpdate(
-      { _id: id, tenantId },
-      { $set: { isArchived: true } },
-      { new: true }
+    // Hard delete
+    const product = await Product.findOneAndDelete(
+      { _id: id, tenantId }
     );
 
     if (!product) {
       return res.status(404).json({ success: false, message: 'Product not found' });
     }
 
-    return res.json({ success: true, message: 'Product archived successfully', product });
+    return res.json({ success: true, message: 'Product deleted successfully', product });
   } catch (err) {
     console.error('[Products] adminDeleteProduct error:', err.message);
     return res.status(500).json({ success: false, message: 'Server error' });

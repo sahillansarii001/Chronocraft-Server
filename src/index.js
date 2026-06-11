@@ -83,7 +83,7 @@ const PORT = process.env.PORT || 5000;
 
 async function start() {
   await connectDB();
-  app.listen(PORT, () => {
+  app.listen(PORT, '0.0.0.0', () => {
     console.log(
       `[Server] Chrono Craft API running on port ${PORT} (${process.env.NODE_ENV || 'development'})`
     );
@@ -96,3 +96,4 @@ async function start() {
 start();
 
 module.exports = app; // exported for testing
+// server restart trigger
