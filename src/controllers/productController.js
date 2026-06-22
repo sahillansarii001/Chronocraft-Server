@@ -134,10 +134,26 @@ exports.getBrandProducts = async (req, res) => {
 // GET /api/admin/products
 exports.adminGetProducts = async (req, res) => {
   const { tenantId } = req;
+  const { page = 1, limit = 20 } = req.query;
 
   try {
-    const products = await Product.find({ tenantId }).sort({ createdAt: -1 }).lean();
-    return res.json(products);
+    const skip = (Number(page) - 1) * Number(limit);
+    const products = await Product.find({ tenantId })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(Number(limit))
+      .lean();
+
+    const total = await Product.countDocuments({ tenantId });
+    const totalPages = Math.ceil(total / Number(limit));
+
+    return res.json({
+      success: true,
+      products,
+      page: Number(page),
+      totalPages,
+      total
+    });
   } catch (err) {
     console.error('[Products] adminGetProducts error:', err.message);
     return res.status(500).json({ success: false, message: 'Server error' });
