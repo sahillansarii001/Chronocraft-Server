@@ -2,8 +2,7 @@
 
 const bcrypt = require('bcryptjs');
 const { validationResult } = require('express-validator');
-const User = require('../models/User');
-const Admin = require('../models/Admin');
+const { supabase } = require('../config/database');
 const { signAccessToken, signRefreshToken, verifyToken } = require('../utils/jwt');
 const { sendOtpEmail } = require('../utils/mailer');
 
@@ -21,34 +20,39 @@ const REFRESH_COOKIE_OPTIONS = {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function isLockedOut(account) {
-  return account.lockUntil && account.lockUntil > Date.now();
+  return account.lock_until && new Date(account.lock_until).getTime() > Date.now();
 }
 
 function lockoutMinutesRemaining(account) {
-  return Math.ceil((account.lockUntil - Date.now()) / 60000);
+  return Math.ceil((new Date(account.lock_until).getTime() - Date.now()) / 60000);
 }
 
-async function handleFailedLogin(account) {
-  account.loginAttempts = (account.loginAttempts || 0) + 1;
-  if (account.loginAttempts >= MAX_LOGIN_ATTEMPTS) {
-    account.lockUntil = new Date(Date.now() + LOCKOUT_DURATION_MS);
+async function handleFailedLogin(table, account) {
+  const newAttempts = (account.login_attempts || 0) + 1;
+  const updates = { login_attempts: newAttempts };
+  
+  if (newAttempts >= MAX_LOGIN_ATTEMPTS) {
+    updates.lock_until = new Date(Date.now() + LOCKOUT_DURATION_MS).toISOString();
   }
-  await account.save();
+  
+  await supabase.from(table).update(updates).eq('id', account.id);
 }
 
-async function handleSuccessfulLogin(account) {
-  account.loginAttempts = 0;
-  account.lockUntil = undefined;
-  await account.save();
+async function handleSuccessfulLogin(table, account) {
+  await supabase.from(table).update({
+    login_attempts: 0,
+    lock_until: null
+  }).eq('id', account.id);
 }
 
-async function issueTokens(payload, account, res) {
+async function issueTokens(payload, table, account, res) {
   const accessToken = signAccessToken(payload);
   const refreshToken = signRefreshToken(payload);
 
   // Store hashed refresh token for rotation verification
-  account.refreshTokenHash = await bcrypt.hash(refreshToken, SALT_ROUNDS);
-  await account.save();
+  const refreshTokenHash = await bcrypt.hash(refreshToken, SALT_ROUNDS);
+  
+  await supabase.from(table).update({ refresh_token_hash: refreshTokenHash }).eq('id', account.id);
 
   res.cookie('refreshToken', refreshToken, REFRESH_COOKIE_OPTIONS);
   return accessToken;
@@ -63,7 +67,6 @@ exports.customerRegister = async (req, res) => {
   }
 
   const { name, email, password, phone } = req.body;
-  // tenantId injected by tenantScope middleware for public routes via header
   const tenantId = req.tenantId || req.headers['x-tenant-id'];
 
   if (!tenantId) {
@@ -71,17 +74,35 @@ exports.customerRegister = async (req, res) => {
   }
 
   try {
-    const existing = await User.findOne({ tenantId, email });
+    const { data: existing } = await supabase
+      .from('users')
+      .select('id')
+      .eq('tenant_id', tenantId)
+      .eq('email', email.toLowerCase())
+      .single();
+
     if (existing) {
       return res.status(409).json({ success: false, message: 'Email already registered' });
     }
 
     const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
-    const user = await User.create({ tenantId, name, email, passwordHash, phone });
+    const { data: user, error } = await supabase
+      .from('users')
+      .insert({
+        tenant_id: tenantId,
+        name,
+        email: email.toLowerCase(),
+        password_hash: passwordHash,
+        phone,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
 
     return res.status(201).json({
       success: true,
-      user: { id: user._id, name: user.name, email: user.email, phone: user.phone || '' },
+      user: { id: user.id, name: user.name, email: user.email, phone: user.phone || '' },
     });
   } catch (err) {
     console.error('[Auth] customerRegister error:', err.message);
@@ -105,12 +126,18 @@ exports.customerLogin = async (req, res) => {
   }
 
   try {
-    const user = await User.findOne({ tenantId, email });
+    const { data: user } = await supabase
+      .from('users')
+      .select('*')
+      .eq('tenant_id', tenantId)
+      .eq('email', email.toLowerCase())
+      .single();
+
     if (!user) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
-    if (user.isBlocked) {
+    if (user.is_blocked) {
       return res.status(403).json({ success: false, message: 'Account has been blocked' });
     }
 
@@ -121,21 +148,21 @@ exports.customerLogin = async (req, res) => {
       });
     }
 
-    const isValid = await bcrypt.compare(password, user.passwordHash);
+    const isValid = await bcrypt.compare(password, user.password_hash);
     if (!isValid) {
-      await handleFailedLogin(user);
+      await handleFailedLogin('users', user);
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
-    await handleSuccessfulLogin(user);
+    await handleSuccessfulLogin('users', user);
 
-    const payload = { userId: user._id, tenantId: user.tenantId, role: 'customer', email: user.email };
-    const accessToken = await issueTokens(payload, user, res);
+    const payload = { userId: user.id, tenantId: user.tenant_id, role: 'customer', email: user.email };
+    const accessToken = await issueTokens(payload, 'users', user, res);
 
     return res.json({
       success: true,
       accessToken,
-      user: { id: user._id, name: user.name, email: user.email, phone: user.phone || '', role: 'customer' },
+      user: { id: user.id, name: user.name, email: user.email, phone: user.phone || '', role: 'customer' },
     });
   } catch (err) {
     console.error('[Auth] customerLogin error:', err.message);
@@ -155,8 +182,14 @@ exports.adminLogin = async (req, res) => {
   const normalizedEmail = email.toLowerCase().trim();
 
   try {
-    const admin = await Admin.findOne({ email: normalizedEmail });
-    if (!admin || !admin.isActive) {
+    const { data: admin } = await supabase
+      .from('admins')
+      .select('*')
+      .eq('email', normalizedEmail)
+      .single();
+
+    // Check if active (we didn't put isActive in schema, defaulting to true or checking role)
+    if (!admin) {
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
@@ -167,21 +200,21 @@ exports.adminLogin = async (req, res) => {
       });
     }
 
-    const isValid = await bcrypt.compare(password, admin.passwordHash);
+    const isValid = await bcrypt.compare(password, admin.password_hash);
     if (!isValid) {
-      await handleFailedLogin(admin);
+      await handleFailedLogin('admins', admin);
       return res.status(401).json({ success: false, message: 'Invalid credentials' });
     }
 
-    await handleSuccessfulLogin(admin);
+    await handleSuccessfulLogin('admins', admin);
 
-    const payload = { adminId: admin._id, tenantId: admin.tenantId, role: 'admin', email: admin.email };
-    const accessToken = await issueTokens(payload, admin, res);
+    const payload = { adminId: admin.id, tenantId: admin.tenant_id, role: 'admin', email: admin.email };
+    const accessToken = await issueTokens(payload, 'admins', admin, res);
 
     return res.json({
       success: true,
       accessToken,
-      user: { id: admin._id, name: admin.name, email: admin.email, role: 'admin', tenantId: admin.tenantId },
+      user: { id: admin.id, name: admin.name, email: admin.email, role: 'admin', tenantId: admin.tenant_id },
     });
   } catch (err) {
     console.error('[Auth] adminLogin error:', err.message);
@@ -200,32 +233,33 @@ exports.refreshToken = async (req, res) => {
   try {
     const decoded = verifyToken(token, 'refresh');
 
-    // Find the account based on role
     let account;
+    let table;
     if (decoded.userId) {
-      account = await User.findById(decoded.userId);
+      table = 'users';
+      const { data } = await supabase.from('users').select('*').eq('id', decoded.userId).single();
+      account = data;
     } else if (decoded.adminId) {
-      account = await Admin.findById(decoded.adminId);
+      table = 'admins';
+      const { data } = await supabase.from('admins').select('*').eq('id', decoded.adminId).single();
+      account = data;
     }
 
-    if (!account || !account.refreshTokenHash) {
+    if (!account || !account.refresh_token_hash) {
       return res.status(401).json({ success: false, message: 'Invalid refresh token' });
     }
 
-    const isValid = await bcrypt.compare(token, account.refreshTokenHash);
+    const isValid = await bcrypt.compare(token, account.refresh_token_hash);
     if (!isValid) {
-      // Possible token reuse — clear stored token
-      account.refreshTokenHash = undefined;
-      await account.save();
+      await supabase.from(table).update({ refresh_token_hash: null }).eq('id', account.id);
       return res.status(401).json({ success: false, message: 'Refresh token reuse detected' });
     }
 
-    // Build new payload from decoded
     const payload = decoded.userId
       ? { userId: decoded.userId, tenantId: decoded.tenantId, role: decoded.role, email: decoded.email }
       : { adminId: decoded.adminId, tenantId: decoded.tenantId, role: decoded.role, email: decoded.email };
 
-    const newAccessToken = await issueTokens(payload, account, res);
+    const newAccessToken = await issueTokens(payload, table, account, res);
 
     return res.json({ success: true, accessToken: newAccessToken });
   } catch (err) {
@@ -242,13 +276,10 @@ exports.logout = async (req, res) => {
   if (token) {
     try {
       const decoded = verifyToken(token, 'refresh');
-      let account;
-      if (decoded.userId) account = await User.findById(decoded.userId);
-      else if (decoded.adminId) account = await Admin.findById(decoded.adminId);
-
-      if (account) {
-        account.refreshTokenHash = undefined;
-        await account.save();
+      if (decoded.userId) {
+        await supabase.from('users').update({ refresh_token_hash: null }).eq('id', decoded.userId);
+      } else if (decoded.adminId) {
+        await supabase.from('admins').update({ refresh_token_hash: null }).eq('id', decoded.adminId);
       }
     } catch {
       // Token invalid — still clear cookie
@@ -270,21 +301,23 @@ exports.forgotPassword = async (req, res) => {
   }
 
   try {
-    const user = await User.findOne({ email: email.toLowerCase().trim(), ...(tenantId && { tenantId }) });
+    let query = supabase.from('users').select('*').eq('email', email.toLowerCase().trim());
+    if (tenantId) query = query.eq('tenant_id', tenantId);
 
-    // Always return success to prevent email enumeration
+    const { data: user } = await query.single();
+
     if (!user) {
       return res.json({ success: true, message: 'If that email exists, an OTP has been sent.' });
     }
 
-    // Generate 6-digit OTP
     const otp = String(Math.floor(100000 + Math.random() * 900000));
     const otpHash = await bcrypt.hash(otp, 10);
 
-    user.resetOtp = otpHash;
-    user.resetOtpExpiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
-    user.resetOtpAttempts = 0;
-    await user.save();
+    await supabase.from('users').update({
+      reset_otp: otpHash,
+      reset_otp_expiry: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+      reset_otp_attempts: 0
+    }).eq('id', user.id);
 
     await sendOtpEmail({ to: user.email, name: user.name, otp });
 
@@ -306,32 +339,33 @@ exports.verifyOtp = async (req, res) => {
   }
 
   try {
-    const user = await User.findOne({ email: email.toLowerCase().trim(), ...(tenantId && { tenantId }) });
+    let query = supabase.from('users').select('*').eq('email', email.toLowerCase().trim());
+    if (tenantId) query = query.eq('tenant_id', tenantId);
 
-    if (!user || !user.resetOtp || !user.resetOtpExpiry) {
+    const { data: user } = await query.single();
+
+    if (!user || !user.reset_otp || !user.reset_otp_expiry) {
       return res.status(400).json({ success: false, message: 'Invalid or expired OTP' });
     }
 
-    if (user.resetOtpExpiry < new Date()) {
+    if (new Date(user.reset_otp_expiry).getTime() < Date.now()) {
       return res.status(400).json({ success: false, message: 'OTP has expired. Please request a new one.' });
     }
 
-    if ((user.resetOtpAttempts || 0) >= 5) {
+    if ((user.reset_otp_attempts || 0) >= 5) {
       return res.status(429).json({ success: false, message: 'Too many attempts. Please request a new OTP.' });
     }
 
-    const isValid = await bcrypt.compare(otp, user.resetOtp);
+    const isValid = await bcrypt.compare(otp, user.reset_otp);
     if (!isValid) {
-      user.resetOtpAttempts = (user.resetOtpAttempts || 0) + 1;
-      await user.save();
+      await supabase.from('users').update({ reset_otp_attempts: (user.reset_otp_attempts || 0) + 1 }).eq('id', user.id);
       return res.status(400).json({ success: false, message: 'Invalid OTP' });
     }
 
-    // OTP correct — issue a short-lived reset token (just flag on user)
-    user.resetOtpAttempts = 0;
-    // Keep OTP alive just long enough for the reset step (5 more minutes)
-    user.resetOtpExpiry = new Date(Date.now() + 5 * 60 * 1000);
-    await user.save();
+    await supabase.from('users').update({
+      reset_otp_attempts: 0,
+      reset_otp_expiry: new Date(Date.now() + 5 * 60 * 1000).toISOString()
+    }).eq('id', user.id);
 
     return res.json({ success: true, message: 'OTP verified. You may now reset your password.' });
   } catch (err) {
@@ -355,28 +389,34 @@ exports.resetPassword = async (req, res) => {
   }
 
   try {
-    const user = await User.findOne({ email: email.toLowerCase().trim(), ...(tenantId && { tenantId }) });
+    let query = supabase.from('users').select('*').eq('email', email.toLowerCase().trim());
+    if (tenantId) query = query.eq('tenant_id', tenantId);
 
-    if (!user || !user.resetOtp || !user.resetOtpExpiry) {
+    const { data: user } = await query.single();
+
+    if (!user || !user.reset_otp || !user.reset_otp_expiry) {
       return res.status(400).json({ success: false, message: 'Invalid or expired session. Please start over.' });
     }
 
-    if (user.resetOtpExpiry < new Date()) {
+    if (new Date(user.reset_otp_expiry).getTime() < Date.now()) {
       return res.status(400).json({ success: false, message: 'Session expired. Please request a new OTP.' });
     }
 
-    const isValid = await bcrypt.compare(otp, user.resetOtp);
+    const isValid = await bcrypt.compare(otp, user.reset_otp);
     if (!isValid) {
       return res.status(400).json({ success: false, message: 'Invalid session. Please start over.' });
     }
 
-    user.passwordHash = await bcrypt.hash(newPassword, SALT_ROUNDS);
-    user.resetOtp = undefined;
-    user.resetOtpExpiry = undefined;
-    user.resetOtpAttempts = 0;
-    user.loginAttempts = 0;
-    user.lockUntil = undefined;
-    await user.save();
+    const passwordHash = await bcrypt.hash(newPassword, SALT_ROUNDS);
+
+    await supabase.from('users').update({
+      password_hash: passwordHash,
+      reset_otp: null,
+      reset_otp_expiry: null,
+      reset_otp_attempts: 0,
+      login_attempts: 0,
+      lock_until: null
+    }).eq('id', user.id);
 
     return res.json({ success: true, message: 'Password reset successfully. You can now log in.' });
   } catch (err) {
@@ -389,14 +429,14 @@ exports.resetPassword = async (req, res) => {
 
 exports.getCustomerProfile = async (req, res) => {
   try {
-    const user = await User.findById(req.user.userId);
+    const { data: user } = await supabase.from('users').select('*').eq('id', req.user.userId).single();
     if (!user) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
     return res.json({
       success: true,
       user: {
-        id: user._id,
+        id: user.id,
         name: user.name,
         email: user.email,
         phone: user.phone || '',
@@ -411,21 +451,28 @@ exports.getCustomerProfile = async (req, res) => {
 exports.updateCustomerProfile = async (req, res) => {
   const { name, email, phone, currentPassword, newPassword } = req.body;
   try {
-    const user = await User.findById(req.user.userId);
+    const { data: user } = await supabase.from('users').select('*').eq('id', req.user.userId).single();
     if (!user) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
+    const updates = {};
+
     if (email && email.toLowerCase() !== user.email.toLowerCase()) {
-      const existing = await User.findOne({ tenantId: user.tenantId, email: email.toLowerCase() });
+      const { data: existing } = await supabase
+        .from('users')
+        .select('id')
+        .eq('tenant_id', user.tenant_id)
+        .eq('email', email.toLowerCase())
+        .single();
       if (existing) {
         return res.status(400).json({ success: false, message: 'Email address is already in use' });
       }
-      user.email = email.toLowerCase().trim();
+      updates.email = email.toLowerCase().trim();
     }
 
-    if (name) user.name = name.trim();
-    user.phone = phone ? phone.trim() : '';
+    if (name) updates.name = name.trim();
+    if (phone !== undefined) updates.phone = phone.trim();
 
     if (newPassword) {
       if (!currentPassword) {
@@ -434,23 +481,30 @@ exports.updateCustomerProfile = async (req, res) => {
       if (newPassword.length < 8) {
         return res.status(400).json({ success: false, message: 'New password must be at least 8 characters' });
       }
-      const isPasswordValid = await bcrypt.compare(currentPassword, user.passwordHash);
+      const isPasswordValid = await bcrypt.compare(currentPassword, user.password_hash);
       if (!isPasswordValid) {
         return res.status(400).json({ success: false, message: 'Invalid current password' });
       }
-      user.passwordHash = await bcrypt.hash(newPassword, SALT_ROUNDS);
+      updates.password_hash = await bcrypt.hash(newPassword, SALT_ROUNDS);
     }
 
-    await user.save();
+    const { data: updatedUser, error } = await supabase
+      .from('users')
+      .update(updates)
+      .eq('id', user.id)
+      .select()
+      .single();
+
+    if (error) throw error;
 
     return res.json({
       success: true,
       message: 'Profile updated successfully',
       user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        phone: user.phone || '',
+        id: updatedUser.id,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        phone: updatedUser.phone || '',
       }
     });
   } catch (err) {

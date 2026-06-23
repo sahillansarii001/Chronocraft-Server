@@ -1,8 +1,6 @@
 'use strict';
 
-const Order = require('../models/Order');
-const Product = require('../models/Product');
-const User = require('../models/User');
+const { supabase } = require('../config/database');
 const { sendOrderConfirmationEmail, sendOrderStatusEmail } = require('../utils/mailer');
 
 // Helper to generate unique order numbers
@@ -31,7 +29,13 @@ exports.createOrder = async (req, res) => {
     // 1. Verify stock for each item & prepare items array
     const verifiedItems = [];
     for (const item of items) {
-      const product = await Product.findOne({ _id: item.id || item.productId, tenantId });
+      const { data: product } = await supabase
+        .from('products')
+        .select('*')
+        .eq('id', item.id || item.productId)
+        .eq('tenant_id', tenantId)
+        .single();
+
       if (!product) {
         return res.status(404).json({ success: false, message: `Product not found: ${item.name}` });
       }
@@ -44,7 +48,7 @@ exports.createOrder = async (req, res) => {
       }
 
       verifiedItems.push({
-        productId: product._id,
+        productId: product.id,
         name: product.name,
         sku: product.sku,
         price: product.price,
@@ -53,42 +57,49 @@ exports.createOrder = async (req, res) => {
       });
     }
 
-    // 2. Decrement stock
+    // 2. Decrement stock (Since there's no atomic decrement in REST easily without RPC, we just read and write back)
     for (const item of items) {
-      await Product.findByIdAndUpdate(item.id || item.productId, {
-        $inc: { stock: -item.quantity },
-      });
+      const { data: p } = await supabase.from('products').select('stock').eq('id', item.id || item.productId).single();
+      if (p) {
+        await supabase.from('products').update({ stock: p.stock - item.quantity }).eq('id', item.id || item.productId);
+      }
     }
 
     // 3. Generate unique order number
     let orderNumber = generateOrderNumber();
     let isUnique = false;
     while (!isUnique) {
-      const existing = await Order.findOne({ orderNumber });
+      const { data: existing } = await supabase.from('orders').select('id').eq('order_number', orderNumber).single();
       if (!existing) isUnique = true;
       else orderNumber = generateOrderNumber();
     }
 
     // 4. Create Order
     const statusHistory = [{ status: 'pending', timestamp: new Date(), note: 'Order placed successfully' }];
-    const order = await Order.create({
-      tenantId,
-      userId,
-      orderNumber,
-      items: verifiedItems,
-      subtotal,
-      discount,
-      total,
-      couponCode,
-      shippingAddress,
-      paymentStatus: 'pending',
-      paymentProvider,
-      status: 'pending',
-      statusHistory,
-    });
+    const { data: order, error } = await supabase
+      .from('orders')
+      .insert({
+        tenant_id: tenantId,
+        user_id: userId,
+        order_number: orderNumber,
+        items: verifiedItems,
+        subtotal,
+        discount,
+        total,
+        coupon_code: couponCode,
+        shipping_address: shippingAddress,
+        payment_status: 'pending',
+        payment_provider: paymentProvider,
+        status: 'pending',
+        status_history: statusHistory,
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
 
     // Fire-and-forget confirmation email
-    User.findById(userId).lean().then((customer) => {
+    supabase.from('users').select('*').eq('id', userId).single().then(({ data: customer }) => {
       if (customer?.email) {
         sendOrderConfirmationEmail({ to: customer.email, name: customer.name, order })
           .catch((e) => console.error('[Mailer] order confirm email failed:', e.message));
@@ -111,18 +122,23 @@ exports.getOrderById = async (req, res) => {
   const { id } = req.params;
 
   try {
-    const order = await Order.findById(id).lean();
-    if (!order) {
+    const { data: order, error } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (error || !order) {
       return res.status(404).json({ success: false, message: 'Order not found' });
     }
 
     // Customer can only view their own orders
-    if (req.user.role === 'customer' && String(order.userId) !== String(req.user.userId)) {
+    if (req.user.role === 'customer' && String(order.user_id) !== String(req.user.userId)) {
       return res.status(403).json({ success: false, message: 'Forbidden' });
     }
 
     // Admin can only view their own tenant's orders
-    if (req.user.role === 'admin' && String(order.tenantId) !== String(req.user.tenantId)) {
+    if (req.user.role === 'admin' && String(order.tenant_id) !== String(req.user.tenantId)) {
       return res.status(403).json({ success: false, message: 'Forbidden' });
     }
 
@@ -142,7 +158,14 @@ exports.getCustomerOrders = async (req, res) => {
   const { tenantId, userId } = req.user;
 
   try {
-    const orders = await Order.find({ tenantId, userId }).sort({ createdAt: -1 }).lean();
+    const { data: orders, error } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('tenant_id', tenantId)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
     return res.json(orders);
   } catch (err) {
     console.error('[Orders] getCustomerOrders error:', err.message);
@@ -157,11 +180,21 @@ exports.adminGetOrders = async (req, res) => {
   const { tenantId } = req;
 
   try {
-    const orders = await Order.find({ tenantId })
-      .sort({ createdAt: -1 })
-      .populate('userId', 'name email phone')
-      .lean();
-    return res.json(orders);
+    const { data: orders, error } = await supabase
+      .from('orders')
+      .select('*, user:users(name, email, phone)')
+      .eq('tenant_id', tenantId)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+
+    // Transform user object to match previous mongoose populate structure if needed
+    const formatted = orders.map(o => ({
+      ...o,
+      userId: o.user
+    }));
+
+    return res.json(formatted);
   } catch (err) {
     console.error('[Orders] adminGetOrders error:', err.message);
     return res.status(500).json({ success: false, message: 'Server error' });
@@ -175,42 +208,58 @@ exports.adminUpdateOrderStatus = async (req, res) => {
   const { status, paymentStatus, note } = req.body;
 
   try {
-    const order = await Order.findOne({ _id: id, tenantId });
-    if (!order) {
+    const { data: order, error } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('id', id)
+      .eq('tenant_id', tenantId)
+      .single();
+
+    if (error || !order) {
       return res.status(404).json({ success: false, message: 'Order not found' });
     }
 
+    const updates = {};
     if (status) {
-      order.status = status;
-      order.statusHistory.push({
+      updates.status = status;
+      const history = order.status_history || [];
+      history.push({
         status,
         timestamp: new Date(),
         note: note || `Order status updated to ${status}`,
       });
+      updates.status_history = history;
     }
 
     if (paymentStatus) {
-      order.paymentStatus = paymentStatus;
+      updates.payment_status = paymentStatus;
     }
 
-    await order.save();
+    const { data: updatedOrder, error: updateErr } = await supabase
+      .from('orders')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (updateErr) throw updateErr;
 
     // Fire-and-forget status update email
     if (status) {
       try {
-        const customer = await User.findById(order.userId).lean();
+        const { data: customer } = await supabase.from('users').select('*').eq('id', order.user_id).single();
         if (customer?.email) {
           sendOrderStatusEmail({
             to: customer.email,
             name: customer.name,
-            order,
+            order: updatedOrder,
             status,
           }).catch((e) => console.error('[Mailer] status email failed:', e.message));
         }
       } catch (_) { /* non-blocking */ }
     }
 
-    return res.json({ success: true, order });
+    return res.json({ success: true, order: updatedOrder });
   } catch (err) {
     console.error('[Orders] adminUpdateOrderStatus error:', err.message);
     return res.status(500).json({ success: false, message: err.message || 'Server error' });

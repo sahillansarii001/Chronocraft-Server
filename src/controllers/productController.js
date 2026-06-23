@@ -1,6 +1,6 @@
 'use strict';
 
-const Product = require('../models/Product');
+const { supabase } = require('../config/database');
 
 // Helper to generate slug from name
 function generateSlug(name) {
@@ -17,55 +17,60 @@ exports.getProducts = async (req, res) => {
   const { tenantId } = req;
   const { brand, minPrice, maxPrice, condition, sort, q, gender, page = 1, limit = 12 } = req.query;
 
-  const query = { tenantId, isArchived: { $ne: true } };
-
-  // Gender filter
-  if (gender) {
-    const genders = gender.split(',');
-    query.gender = { $in: genders };
-  }
-
-  // Brand filter
-  if (brand) {
-    const brands = brand.split(',');
-    query.brand = { $in: brands };
-  }
-
-  // Price filter
-  if (minPrice || maxPrice) {
-    query.price = {};
-    if (minPrice) query.price.$gte = Number(minPrice);
-    if (maxPrice) query.price.$lte = Number(maxPrice);
-  }
-
-  // Condition filter
-  if (condition) {
-    const conditions = condition.split(',');
-    query.condition = { $in: conditions };
-  }
-
-  // Search query (name or brand)
-  if (q) {
-    query.$or = [
-      { name: { $regex: q, $options: 'i' } },
-      { brand: { $regex: q, $options: 'i' } },
-    ];
-  }
-
-  // Sort
-  let sortOption = { createdAt: -1 }; // default: newest
-  if (sort === 'price_asc') sortOption = { price: 1 };
-  if (sort === 'price_desc') sortOption = { price: -1 };
-
   try {
-    const skip = (Number(page) - 1) * Number(limit);
-    const products = await Product.find(query)
-      .sort(sortOption)
-      .skip(skip)
-      .limit(Number(limit))
-      .lean();
+    let query = supabase
+      .from('products')
+      .select('*', { count: 'exact' })
+      .eq('tenant_id', tenantId)
+      .neq('is_archived', true);
 
-    const total = await Product.countDocuments(query);
+    // Gender filter
+    if (gender) {
+      const genders = gender.split(',');
+      query = query.in('gender', genders);
+    }
+
+    // Brand filter
+    if (brand) {
+      const brands = brand.split(',');
+      query = query.in('brand', brands);
+    }
+
+    // Price filter
+    if (minPrice) {
+      query = query.gte('price', Number(minPrice));
+    }
+    if (maxPrice) {
+      query = query.lte('price', Number(maxPrice));
+    }
+
+    // Condition filter
+    if (condition) {
+      const conditions = condition.split(',');
+      query = query.in('condition', conditions);
+    }
+
+    // Search query (name or brand)
+    if (q) {
+      query = query.or(`name.ilike.%${q}%,brand.ilike.%${q}%`);
+    }
+
+    // Sort
+    if (sort === 'price_asc') {
+      query = query.order('price', { ascending: true });
+    } else if (sort === 'price_desc') {
+      query = query.order('price', { ascending: false });
+    } else {
+      query = query.order('created_at', { ascending: false });
+    }
+
+    const skip = (Number(page) - 1) * Number(limit);
+    const to = skip + Number(limit) - 1;
+
+    const { data: products, count: total, error } = await query.range(skip, to);
+
+    if (error) throw error;
+
     const hasMore = total > skip + products.length;
 
     return res.json({
@@ -85,9 +90,15 @@ exports.getProducts = async (req, res) => {
 exports.getFeaturedProducts = async (req, res) => {
   const { tenantId } = req;
   try {
-    const products = await Product.find({ tenantId, isFeatured: true, isArchived: { $ne: true } })
-      .limit(6)
-      .lean();
+    const { data: products, error } = await supabase
+      .from('products')
+      .select('*')
+      .eq('tenant_id', tenantId)
+      .eq('is_featured', true)
+      .neq('is_archived', true)
+      .limit(6);
+
+    if (error) throw error;
     return res.json(products);
   } catch (err) {
     console.error('[Products] getFeaturedProducts error:', err.message);
@@ -101,9 +112,19 @@ exports.getProductBySlug = async (req, res) => {
   const { slug } = req.params;
 
   try {
-    const product = await Product.findOne({ tenantId, slug, isArchived: { $ne: true } }).lean();
-    if (!product) {
-      return res.status(404).json({ success: false, message: 'Product not found' });
+    const { data: product, error } = await supabase
+      .from('products')
+      .select('*')
+      .eq('tenant_id', tenantId)
+      .eq('slug', slug)
+      .neq('is_archived', true)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ success: false, message: 'Product not found' });
+      }
+      throw error;
     }
     return res.json(product);
   } catch (err) {
@@ -119,9 +140,15 @@ exports.getBrandProducts = async (req, res) => {
   const limit = Number(req.query.limit) || 4;
 
   try {
-    const products = await Product.find({ tenantId, brand, isArchived: { $ne: true } })
-      .limit(limit)
-      .lean();
+    const { data: products, error } = await supabase
+      .from('products')
+      .select('*')
+      .eq('tenant_id', tenantId)
+      .eq('brand', brand)
+      .neq('is_archived', true)
+      .limit(limit);
+
+    if (error) throw error;
     return res.json(products);
   } catch (err) {
     console.error('[Products] getBrandProducts error:', err.message);
@@ -138,13 +165,17 @@ exports.adminGetProducts = async (req, res) => {
 
   try {
     const skip = (Number(page) - 1) * Number(limit);
-    const products = await Product.find({ tenantId })
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(Number(limit))
-      .lean();
+    const to = skip + Number(limit) - 1;
 
-    const total = await Product.countDocuments({ tenantId });
+    const { data: products, count: total, error } = await supabase
+      .from('products')
+      .select('*', { count: 'exact' })
+      .eq('tenant_id', tenantId)
+      .order('created_at', { ascending: false })
+      .range(skip, to);
+
+    if (error) throw error;
+
     const totalPages = Math.ceil(total / Number(limit));
 
     return res.json({
@@ -170,16 +201,48 @@ exports.adminCreateProduct = async (req, res) => {
       data.slug = generateSlug(data.name);
     }
     // Check slug uniqueness for this tenant
-    const existing = await Product.findOne({ tenantId, slug: data.slug });
+    const { data: existing } = await supabase
+      .from('products')
+      .select('id')
+      .eq('tenant_id', tenantId)
+      .eq('slug', data.slug)
+      .single();
+
     if (existing) {
       // Append a small random number or SKU to make slug unique
       data.slug = `${data.slug}-${data.sku || Math.floor(Math.random() * 1000)}`;
     }
 
-    const product = await Product.create({
-      ...data,
-      tenantId,
-    });
+    const { data: product, error } = await supabase
+      .from('products')
+      .insert({
+        tenant_id: tenantId,
+        category_id: data.categoryId || data.category,
+        name: data.name,
+        slug: data.slug,
+        brand: data.brand,
+        sku: data.sku,
+        price: data.price,
+        original_price: data.originalPrice,
+        condition: data.condition,
+        dial: data.dial,
+        case_material: data.caseMaterial,
+        movement: data.movement,
+        gender: data.gender,
+        case_size: data.caseSize,
+        year_of_manufacture: data.yearOfManufacture,
+        included_items: data.includedItems || [],
+        images: data.images || [],
+        stock: data.stock || 1,
+        tags: data.tags || [],
+        whatsapp_enquiry: data.whatsappEnquiry,
+        is_featured: data.isFeatured,
+        is_archived: data.isArchived
+      })
+      .select()
+      .single();
+
+    if (error) throw error;
 
     return res.status(201).json({ success: true, product });
   } catch (err) {
@@ -199,14 +262,19 @@ exports.adminUpdateProduct = async (req, res) => {
       updates.slug = generateSlug(updates.name);
     }
 
-    const product = await Product.findOneAndUpdate(
-      { _id: id, tenantId },
-      { $set: updates },
-      { new: true, runValidators: true }
-    );
+    const { data: product, error } = await supabase
+      .from('products')
+      .update(updates)
+      .eq('id', id)
+      .eq('tenant_id', tenantId)
+      .select()
+      .single();
 
-    if (!product) {
-      return res.status(404).json({ success: false, message: 'Product not found' });
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ success: false, message: 'Product not found' });
+      }
+      throw error;
     }
 
     return res.json({ success: true, product });
@@ -223,12 +291,19 @@ exports.adminDeleteProduct = async (req, res) => {
 
   try {
     // Hard delete
-    const product = await Product.findOneAndDelete(
-      { _id: id, tenantId }
-    );
+    const { data: product, error } = await supabase
+      .from('products')
+      .delete()
+      .eq('id', id)
+      .eq('tenant_id', tenantId)
+      .select()
+      .single();
 
-    if (!product) {
-      return res.status(404).json({ success: false, message: 'Product not found' });
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ success: false, message: 'Product not found' });
+      }
+      throw error;
     }
 
     return res.json({ success: true, message: 'Product deleted successfully', product });
@@ -249,14 +324,41 @@ exports.adminImportProducts = async (req, res) => {
 
   try {
     const formatted = products.map((p) => {
-      if (!p.slug && p.name) p.slug = generateSlug(p.name);
+      let slug = p.slug;
+      if (!slug && p.name) slug = generateSlug(p.name);
       return {
-        ...p,
-        tenantId,
+        tenant_id: tenantId,
+        category_id: p.categoryId || p.category,
+        name: p.name,
+        slug: slug,
+        brand: p.brand,
+        sku: p.sku,
+        price: p.price,
+        original_price: p.originalPrice,
+        condition: p.condition,
+        dial: p.dial,
+        case_material: p.caseMaterial,
+        movement: p.movement,
+        gender: p.gender,
+        case_size: p.caseSize,
+        year_of_manufacture: p.yearOfManufacture,
+        included_items: p.includedItems || [],
+        images: p.images || [],
+        stock: p.stock || 1,
+        tags: p.tags || [],
+        whatsapp_enquiry: p.whatsappEnquiry,
+        is_featured: p.isFeatured,
+        is_archived: p.isArchived
       };
     });
 
-    const result = await Product.insertMany(formatted);
+    const { data: result, error } = await supabase
+      .from('products')
+      .insert(formatted)
+      .select();
+
+    if (error) throw error;
+    
     return res.status(201).json({ success: true, count: result.length, products: result });
   } catch (err) {
     console.error('[Products] adminImportProducts error:', err.message);

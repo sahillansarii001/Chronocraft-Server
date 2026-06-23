@@ -1,6 +1,6 @@
 'use strict';
 
-const Tenant = require('../models/Tenant');
+const { supabase } = require('../config/database');
 
 /**
  * tenantScope — injects req.tenantId from JWT claim.
@@ -22,8 +22,8 @@ const tenantScope = async (req, res, next) => {
   }
 
   try {
-    const tenant = await Tenant.findById(tenantId).lean();
-    if (!tenant) {
+    const { data: tenant, error } = await supabase.from('tenants').select('*').eq('id', tenantId).single();
+    if (error || !tenant) {
       return res.status(403).json({ success: false, message: 'Tenant not found' });
     }
     if (tenant.status === 'suspended') {
@@ -49,7 +49,8 @@ const resolveTenantFromHeader = async (req, res, next) => {
   try {
     let tenant;
     if (tenantId) {
-      tenant = await Tenant.findById(tenantId).lean();
+      const { data } = await supabase.from('tenants').select('*').eq('id', tenantId).single();
+      tenant = data;
     } else {
       // Fallback: Resolve tenant by subdomain from the Origin or Referer header
       const origin = req.headers.origin || req.headers.referer;
@@ -71,10 +72,12 @@ const resolveTenantFromHeader = async (req, res, next) => {
         }
       }
 
-      tenant = await Tenant.findOne({ subdomain }).lean();
+      const { data: tenantData } = await supabase.from('tenants').select('*').eq('subdomain', subdomain).single();
+      tenant = tenantData;
       if (!tenant && host === 'localhost') {
         // Fallback to the default localhost tenant if not found
-        tenant = await Tenant.findOne({ subdomain: 'localhost' }).lean();
+        const { data: fallback } = await supabase.from('tenants').select('*').eq('subdomain', 'localhost').single();
+        tenant = fallback;
       }
     }
 
@@ -85,7 +88,7 @@ const resolveTenantFromHeader = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'Tenant account is suspended' });
     }
 
-    req.tenantId = tenant._id.toString();
+    req.tenantId = tenant.id;
     req.tenant = tenant;
     next();
   } catch (err) {

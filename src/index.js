@@ -6,8 +6,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const cookieParser = require('cookie-parser');
-const mongoSanitize = require('mongo-sanitize');
-const connectDB = require('./config/database');
+
 const { generalLimiter, authLimiter, adminLimiter, orderLimiter } = require('./middleware/rateLimiter');
 const { forgotPassword } = require('./controllers/authController');
 const authRoutes = require('./routes/authRoutes');
@@ -37,14 +36,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-// Sanitize all incoming request bodies, query strings, and params
-// to prevent NoSQL injection attacks
-app.use((req, _res, next) => {
-  if (req.body) mongoSanitize(req.body);
-  if (req.query) mongoSanitize(req.query);
-  if (req.params) mongoSanitize(req.params);
-  next();
-});
+
 
 // ── Health check ─────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => {
@@ -86,7 +78,6 @@ app.use((err, _req, res, _next) => {
 const PORT = process.env.PORT || 5000;
 
 async function start() {
-  await connectDB();
   app.listen(PORT, '0.0.0.0', () => {
     console.log(
       `[Server] Chrono Craft API running on port ${PORT} (${process.env.NODE_ENV || 'development'})`

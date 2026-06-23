@@ -1,37 +1,29 @@
 'use strict';
 
-const mongoose = require('mongoose');
+const { createClient } = require('@supabase/supabase-js');
 
-/**
- * Connects to MongoDB Atlas using the MONGODB_URI environment variable.
- * Exits the process with code 1 if the URI is missing or if the connection fails.
- */
+// Initialize the Supabase client
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!supabaseUrl || !supabaseKey) {
+  console.error('[DB] FATAL: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in .env');
+  process.exit(1);
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey);
+
 const connectDB = async () => {
-  const uri = process.env.MONGODB_URI;
-
-  if (!uri) {
-    console.error('[DB] FATAL: MONGODB_URI environment variable is not set.');
-    process.exit(1);
-  }
-
   try {
-    const conn = await mongoose.connect(uri, {
-      serverSelectionTimeoutMS: 10000, // 10s timeout for initial connection
-    });
-
-    console.log(`[DB] MongoDB connected: ${conn.connection.host}`);
-
-    mongoose.connection.on('error', (err) => {
-      console.error('[DB] MongoDB connection error:', err.message);
-    });
-
-    mongoose.connection.on('disconnected', () => {
-      console.warn('[DB] MongoDB disconnected. Mongoose will attempt to reconnect.');
-    });
+    // There is no persistent connection needed to establish for Supabase REST clients,
+    // but we can make a simple query to verify it works.
+    const { error } = await supabase.from('tenants').select('id').limit(1);
+    if (error) throw error;
+    console.log(`[DB] Supabase connected successfully.`);
   } catch (err) {
-    console.error(`[DB] Failed to connect to MongoDB Atlas: ${err.message}`);
+    console.error(`[DB] Failed to connect to Supabase: ${err.message}`);
     process.exit(1);
   }
 };
 
-module.exports = connectDB;
+module.exports = { connectDB, supabase };

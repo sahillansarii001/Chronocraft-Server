@@ -13,8 +13,7 @@
  * to decide when to promote an order to the next stage.
  */
 
-const Order = require('../models/Order');
-const User  = require('../models/User');
+const { supabase } = require('../config/database');
 const { sendOrderStatusEmail } = require('./mailer');
 
 // ── Timing config (milliseconds) ────────────────────────────────────────────
@@ -38,7 +37,8 @@ const NOTE = {
 
 // ── Helper: get timestamp of a specific status entry ────────────────────────
 function getStatusTimestamp(order, statusKey) {
-  const entry = order.statusHistory.find((h) => h.status === statusKey);
+  if (!order.status_history) return null;
+  const entry = order.status_history.find((h) => h.status === statusKey);
   return entry ? new Date(entry.timestamp).getTime() : null;
 }
 
@@ -48,9 +48,12 @@ async function runOrderProgressionJob() {
     const now = Date.now();
 
     // Fetch all orders that are still in a promotable state
-    const orders = await Order.find({
-      status: { $in: ['confirmed', 'processing', 'shipped'] },
-    });
+    const { data: orders, error } = await supabase
+      .from('orders')
+      .select('*')
+      .in('status', ['confirmed', 'processing', 'shipped']);
+
+    if (error || !orders) return;
 
     for (const order of orders) {
       const currentStatus  = order.status;
@@ -65,33 +68,45 @@ async function runOrderProgressionJob() {
       // Not enough time has passed yet — skip
       if (now - enteredAt < delay) continue;
 
-      // Already promoted (shouldn't happen, but guard against double-run)
-      if (order.status !== currentStatus) continue;
-
       // ── Advance status ──────────────────────────────────────────────────
-      order.status = nextStatus;
-      order.statusHistory.push({
-        status:    nextStatus,
+      const newStatus = nextStatus;
+      const history = order.status_history || [];
+      history.push({
+        status:    newStatus,
         timestamp: new Date(),
         note:      NOTE[currentStatus],
       });
 
-      await order.save();
+      const { data: updatedOrder, error: updateError } = await supabase
+        .from('orders')
+        .update({
+          status: newStatus,
+          status_history: history
+        })
+        .eq('id', order.id)
+        .select()
+        .single();
+        
+      if (updateError) {
+        console.error(`[Scheduler] Update failed for ${order.order_number}:`, updateError.message);
+        continue;
+      }
+
       console.log(
-        `[Scheduler] Order ${order.orderNumber}: ${currentStatus} → ${nextStatus}`
+        `[Scheduler] Order ${order.order_number}: ${currentStatus} → ${newStatus}`
       );
 
       // Fire-and-forget customer email
       try {
-        const customer = await User.findById(order.userId).lean();
+        const { data: customer } = await supabase.from('users').select('*').eq('id', order.user_id).single();
         if (customer?.email) {
           sendOrderStatusEmail({
             to:     customer.email,
             name:   customer.name,
-            order,
-            status: nextStatus,
+            order:  updatedOrder,
+            status: newStatus,
           }).catch((e) =>
-            console.error(`[Scheduler] Email failed for ${order.orderNumber}:`, e.message)
+            console.error(`[Scheduler] Email failed for ${order.order_number}:`, e.message)
           );
         }
       } catch (_) { /* non-blocking */ }
